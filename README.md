@@ -1,3 +1,7 @@
+> [!NOTE]
+> Fork of https://github.com/kaarmu/git-token
+> I maintain a copy of it under https://github.com/woynert/dotfiles
+
 # git-token
 
 Manage git tokens with password encrypted files.

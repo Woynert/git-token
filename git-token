@@ -1,7 +1,17 @@
-#! /bin/sh
+#!/usr/bin/env bash
 # Manage git tokens with password encrypted files.
 #
 # Author: Kaj Munhoz Arfvidsson
+# Original source: https://github.com/kaarmu/git-token
+
+# Woynert change history:
+#   * Use bash instead of sh to pass passwords using bash "here-string" (<<<) construct instead of echo + pipe.
+#   * Use openssl instead of gpg: because openssl allows to pump up
+#     the number of iterations making brute force attacks way slower.
+#   * Receive token by secret prompt rather than using cmd argument.
+#   * -a,--add flag: Dedicated flag to add new token.
+#   * -l,--list flag to list tokens.
+
 
 ###############
 ## CONSTANTS ##
@@ -9,6 +19,7 @@
 
 VERSION="0.1.0"
 DATA_DIR="$HOME/.local/share/git-token"
+OPENSSL_ARGS=("enc" "-aes-256-cbc" "-iter" "2000000" "-salt")
 
 ###############
 ## FUNCTIONS ##
@@ -28,10 +39,15 @@ OPTIONS
 
     -v, --version       Print the git-token version.
 
+    -a, --add           Add a new token. You will be
+                        prompted to insert token.
+
     -e, --enable        Enable git credential-cache in
                         globally.
 
     -r, --remove        Remove token.
+
+    -l, --list          List registered tokens.
 
     -f, --force         Write over any existing token.
 
@@ -222,13 +238,15 @@ _write_file() {
 ## SCRIPT ##
 ############
 
-assert_command git gpg
+assert_command git openssl
 
 # program arguments
+ADD=0
 REMOVE=0
 ENABLE=0
 FORCE=0
 UPDATE=0
+LIST=0
 TIMEOUT=900
 ONLY_TOKEN=0
 RECOMMIT=0
@@ -241,7 +259,7 @@ EMAIL=""	# git-config email
 DOMAIN="github.com"
 
 # parse program arguments
-while getopts ":herfut:d:-:" OPT; do
+while getopts ":herfut:d:-:la" OPT; do
 	if [ "$OPT" = "-" ]; then
 		OPT="${OPTARG%%=*}"
 		OPTARG="${OPTARG#"$OPT"}"
@@ -257,8 +275,10 @@ while getopts ":herfut:d:-:" OPT; do
         exit 0
         ;;
 	e | enable) ENABLE=1 ;;
+	a | add) ADD=1 ;;
 	r | remove) REMOVE=1 ;;
 	f | force) FORCE=1 ;;
+	l | list) LIST=1 ;;
 	u | update) UPDATE=1 ;;
 	t | timeout) TIMEOUT="$OPTARG" ;;
 	only-token) ONLY_TOKEN=1 ;;
@@ -270,6 +290,15 @@ while getopts ":herfut:d:-:" OPT; do
 done
 shift $((OPTIND - 1))
 
+# List tokens.
+if [ $LIST -ne 0 ]; then
+	cd ~/.local/share/git-token || panic $? "No tokens found"
+	AMOUNT=$(find . -maxdepth 2 -mindepth 2 | wc -l)
+	find . -maxdepth 2 -mindepth 2
+	echo "Found ($AMOUNT) tokens."
+	exit 0
+fi
+
 # get program positional arguments
 case "$#" in
 0)
@@ -280,7 +309,6 @@ case "$#" in
 	USER=$1
 	[ $ENABLE -ne 0 ] && _enable "$TIMEOUT"
 	[ $REMOVE -ne 0 ] && _remove "$USER" && exit 0
-	[ $UPDATE -ne 0 ] && panic "Missing argument TOKEN"
 	;;
 2)
 	USER=$1
@@ -293,9 +321,6 @@ case "$#" in
 	;;
 esac
 
-# get token from stdin if the token is, e.g. piped in
-[ -p /dev/stdin ] && read -r TOKEN
-
 USER_DIR="$(_find_user "$USER")"
 
 if [ $UPDATE -ne 0 ]; then
@@ -305,14 +330,17 @@ if [ $UPDATE -ne 0 ]; then
 	*) ;;
 	esac
 
+	[ -z "$TOKEN" ] && prompt_secret TOKEN '' "Token"
+	[ -z "$TOKEN" ] && panic "Empty token"
+
 	prompt_secret PASSWD '' "Password"
 
-	gpg --batch --passphrase "$PASSWD" -d "$USER_DIR/token" >/dev/null 2>&1
+	openssl "${OPENSSL_ARGS[@]}" -d -pass stdin -in "$USER_DIR/token" &>/dev/null <<< "$PASSWD"
 	[ $? -ne 0 ] && panic "Password was incorrect"
 
-	echo "$TOKEN" | gpg --batch --yes --passphrase "$PASSWD" -o "$USER_DIR/token" -c || panic $? "Encryption failed"
+	PASSWD="$PASSWD" openssl "${OPENSSL_ARGS[@]}" -pass env:PASSWD -out "$USER_DIR/token" <<< "$TOKEN" || panic $? "Encryption failed"
 
-elif [ -n "$TOKEN" ]; then
+elif [ $ADD -ne 0 ]; then
 
 	case "$USER_DIR" in
 	:) ;;
@@ -334,6 +362,9 @@ elif [ -n "$TOKEN" ]; then
 		EMAIL=""
 	fi
 
+	[ -z "$TOKEN" ] && prompt_secret TOKEN '' "Token"
+	[ -z "$TOKEN" ] && panic "Empty token"
+
 	prompt USERNAME "$USERNAME" "Username"
 	prompt NAME     "$NAME"     "Name"
 	prompt EMAIL    "$EMAIL"    "Email"
@@ -344,7 +375,7 @@ elif [ -n "$TOKEN" ]; then
 	_write_file "$NAME"     "$USER_DIR/name"
 	_write_file "$EMAIL"    "$USER_DIR/email"
 
-	echo "$TOKEN" | gpg --batch --yes --passphrase "$PASSWD" -o "$USER_DIR/token" -c || panic $? "Encryption failed"
+	PASSWD="$PASSWD" openssl "${OPENSSL_ARGS[@]}" -pass env:PASSWD -out "$USER_DIR/token" <<< "$TOKEN" || panic $? "Encryption failed"
 
 else
 
@@ -368,14 +399,14 @@ else
 
 	prompt_secret PASSWD '' "Password"
 
-	SECRET=$(gpg --batch --passphrase "$PASSWD" -d "$USER_DIR/token" 2>/dev/null)
+	SECRET=$(openssl "${OPENSSL_ARGS[@]}" -d -pass stdin -in "$USER_DIR/token" 2>/dev/null <<< "$PASSWD")
 	[ -z "$SECRET" ] && panic "Password was incorrect"
 	_approve "https://$DOMAIN" "$USERNAME" "$SECRET" || panic $? "Approval failed"
 
 	if _credential_is "cache"; then
-		echo "Found token \"$SECRET\" and cached it for a limited time."
+		echo "Found token (length \"${#SECRET}\") and cached it for a limited time."
 	else
-		echo "Found token \"$SECRET\"."
+		echo "Found token (length \"${#SECRET}\")."
 	fi
 
 	[ "$RECOMMIT" -eq 1 ] && _recommit
